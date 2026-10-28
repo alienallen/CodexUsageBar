@@ -1,6 +1,8 @@
 import AppKit
 import Foundation
 import SwiftUI
+import Combine
+import ServiceManagement
 
 struct Window {
     let bucket: String
@@ -80,7 +82,7 @@ func codexPath() throws -> String {
     return path
 }
 
-func readUsage(executable: String) throws -> [Window] {
+func readUsage(executable: String, timeout: TimeInterval = 15) throws -> [Window] {
     let process = Process()
     let input = Pipe()
     let output = Pipe()
@@ -90,10 +92,17 @@ func readUsage(executable: String) throws -> [Window] {
     process.standardOutput = output
     process.standardError = FileHandle.nullDevice
     do { try process.run() } catch { throw Failure("无法启动 Codex CLI。") }
-    let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
-    DispatchQueue.global().asyncAfter(deadline: .now() + 15, execute: timeout)
+    let timeoutLock = NSLock()
+    var timedOut = false
+    let timeoutWork = DispatchWorkItem {
+        timeoutLock.lock()
+        timedOut = true
+        timeoutLock.unlock()
+        if process.isRunning { process.terminate() }
+    }
+    DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timeoutWork)
     defer {
-        timeout.cancel()
+        timeoutWork.cancel()
         try? input.fileHandleForWriting.close()
         if process.isRunning { process.terminate() }
         process.waitUntilExit()
@@ -102,6 +111,7 @@ func readUsage(executable: String) throws -> [Window] {
     let messages: [[String: Any]] = [
         ["method": "initialize", "id": 1, "params": ["clientInfo": ["name": "codex_usage_menu", "title": "Codex Usage Menu", "version": "1.0"]]],
         ["method": "initialized", "params": [:]],
+        ["method": "account/read", "id": 3, "params": ["refreshToken": false]],
         ["method": "account/rateLimits/read", "id": 2]
     ]
     for message in messages {
@@ -109,6 +119,17 @@ func readUsage(executable: String) throws -> [Window] {
         try input.fileHandleForWriting.write(contentsOf: data + Data([10]))
     }
     var buffer = Data()
+    var accountRead = false
+    var accountType: String?
+    var noAccount = false
+    var quotaFailed = false
+    func quotaFailure() -> Failure {
+        if noAccount { return Failure("Codex 尚未登录 ChatGPT，请先登录。") }
+        if accountType == "apiKey" || accountType == "amazonBedrock" {
+            return Failure("当前登录方式不提供 ChatGPT 配额，请登录 ChatGPT。")
+        }
+        return Failure("无法读取配额，请检查网络或稍后重试。")
+    }
     while true {
         let chunk = output.fileHandleForReading.availableData
         if chunk.isEmpty { break }
@@ -121,17 +142,70 @@ func readUsage(executable: String) throws -> [Window] {
             if (object["id"] as? NSNumber)?.intValue == 1, object["error"] != nil {
                 throw Failure("Codex 初始化失败，请检查登录状态。")
             }
+            if (object["id"] as? NSNumber)?.intValue == 3 {
+                accountRead = true
+                if let accountResult = object["result"] as? [String: Any] {
+                    noAccount = accountResult["account"] is NSNull
+                    accountType = (accountResult["account"] as? [String: Any])?["type"] as? String
+                }
+                if quotaFailed { throw quotaFailure() }
+                continue
+            }
             guard (object["id"] as? NSNumber)?.intValue == 2 else { continue }
             guard let result = object["result"] as? [String: Any] else {
-                throw Failure("无法读取配额，请检查网络及 Codex 登录状态。")
+                quotaFailed = true
+                if accountRead { throw quotaFailure() }
+                continue
             }
             return try windows(from: result)
         }
     }
-    throw Failure("读取超时或 Codex 已退出；请检查网络和登录状态。")
+    timeoutLock.lock()
+    let didTimeOut = timedOut
+    timeoutLock.unlock()
+    if didTimeOut { throw Failure("读取超时，请检查网络或稍后重试。") }
+    if quotaFailed { throw quotaFailure() }
+    throw Failure("Codex 服务已退出，请检查登录状态后重试。")
+}
+
+func needsAttention(message: String?, lastUpdate: Date?, now: Date = Date()) -> Bool {
+    if message != nil { return true }
+    guard let lastUpdate = lastUpdate else { return false }
+    return now.timeIntervalSince(lastUpdate) > 150
+}
+
+final class LoginItemController: ObservableObject {
+    private let readStatus: () -> SMAppService.Status
+    private let register: () throws -> Void
+    private let unregister: () throws -> Void
+    @Published private(set) var status: SMAppService.Status
+    @Published private(set) var errorMessage: String?
+
+    init(status: @escaping () -> SMAppService.Status = { SMAppService.mainApp.status },
+         register: @escaping () throws -> Void = { try SMAppService.mainApp.register() },
+         unregister: @escaping () throws -> Void = { try SMAppService.mainApp.unregister() }) {
+        self.readStatus = status
+        self.register = register
+        self.unregister = unregister
+        self.status = status()
+    }
+    var isOn: Bool { status == .enabled || status == .requiresApproval }
+    var requiresApproval: Bool { status == .requiresApproval }
+    func refreshStatus() { status = readStatus() }
+    func setEnabled(_ enabled: Bool) {
+        do {
+            if enabled { try register() } else { try unregister() }
+            errorMessage = nil
+        } catch {
+            errorMessage = "无法更改登录启动，请检查系统设置。"
+        }
+        refreshStatus()
+    }
 }
 
 final class UsageStore: ObservableObject {
+    private let fetch: () throws -> [Window]
+    init(fetch: @escaping () throws -> [Window] = { try readUsage(executable: codexPath()) }) { self.fetch = fetch }
     @Published var windows: [Window] = []
     @Published var loading = false
     @Published var lastUpdate: Date?
@@ -141,7 +215,7 @@ final class UsageStore: ObservableObject {
         guard !loading else { return }
         loading = true
         DispatchQueue.global(qos: .utility).async {
-            let result = Result { try readUsage(executable: codexPath()) }
+            let result = Result { try self.fetch() }
             DispatchQueue.main.async {
                 self.loading = false
                 switch result {
@@ -170,6 +244,7 @@ struct PopoverMaterial: NSViewRepresentable {
 
 struct UsagePanel: View {
     @ObservedObject var store: UsageStore
+    @ObservedObject var login: LoginItemController
     @Environment(\.colorScheme) private var colorScheme
     private var blue: Color {
         colorScheme == .dark ? Color(red: 0.58, green: 0.80, blue: 1) : Color(red: 0.0, green: 0.30, blue: 0.68)
@@ -260,7 +335,24 @@ struct UsagePanel: View {
             }
 
             Spacer(minLength: 0)
-            Divider().padding(.bottom, 11)
+            Toggle(isOn: Binding(get: { login.isOn }, set: { login.setEnabled($0) })) {
+                Label("登录时打开", systemImage: "power")
+                    .font(.system(size: 12))
+            }
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .help("在登录 Mac 后自动启动此应用")
+            if login.requiresApproval {
+                Button("请在系统设置中允许登录启动") { SMAppService.openSystemSettingsLoginItems() }
+                    .buttonStyle(.link)
+                    .font(.system(size: 11))
+                    .padding(.top, 4)
+            }
+            if let error = login.errorMessage {
+                Text(error).font(.system(size: 11)).foregroundStyle(Color(nsColor: .systemOrange))
+                    .fixedSize(horizontal: false, vertical: true).padding(.top, 4)
+            }
+            Divider().padding(.top, 11).padding(.bottom, 11)
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(store.lastUpdate.map { "更新于 " + updateFormatter.string(from: $0) } ?? "等待首次更新")
@@ -277,21 +369,24 @@ struct UsagePanel: View {
             }
         }
         .padding(16)
-        .frame(width: 320, height: 315, alignment: .topLeading)
+        .frame(width: 320, height: 380, alignment: .topLeading)
         .background(PopoverMaterial())
     }
 }
 
 final class MenuApp: NSObject, NSApplicationDelegate {
     private let store = UsageStore()
+    private let login = LoginItemController()
     private var item: NSStatusItem?
     private let popover = NSPopover()
     private var timer: Timer?
+    private var statusTimer: Timer?
+    private var statusObservation: AnyCancellable?
     private var previewWindow: NSWindow?
     private var appearanceObservation: NSKeyValueObservation?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let panel = UsagePanel(store: store)
+        let panel = UsagePanel(store: store, login: login)
         if CommandLine.arguments.contains("--preview") {
             let controller = NSHostingController(rootView: panel)
             let window = NSWindow(contentViewController: controller)
@@ -315,6 +410,11 @@ final class MenuApp: NSObject, NSApplicationDelegate {
                 button.target = self
                 button.action = #selector(togglePopover(_:))
             }
+            statusObservation = store.$message.combineLatest(store.$lastUpdate).sink { [weak self] _, _ in
+                DispatchQueue.main.async { self?.updateStatusIcon() }
+            }
+            statusTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in self?.updateStatusIcon() }
+            updateStatusIcon()
             popover.behavior = .transient
             popover.appearance = NSApp.effectiveAppearance
             appearanceObservation = NSApp.observe(\.effectiveAppearance, options: [.new]) { [weak self] app, _ in
@@ -326,9 +426,21 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.store.refresh() }
     }
 
+    private func updateStatusIcon() {
+        guard let button = item?.button else { return }
+        let attention = needsAttention(message: store.message, lastUpdate: store.lastUpdate)
+        let image = NSImage(systemSymbolName: attention ? "exclamationmark.circle" : "chart.bar.xaxis",
+                            accessibilityDescription: attention ? "Codex 用量需要刷新" : "Codex 用量")
+        image?.isTemplate = true
+        button.image = image
+        button.toolTip = attention ? (store.message ?? "用量数据可能已过期，点击查看") : "Codex 用量"
+    }
+
     @objc private func togglePopover(_ sender: NSStatusBarButton) {
         if popover.isShown { popover.performClose(sender) }
         else {
+            login.refreshStatus()
+            if needsAttention(message: store.message, lastUpdate: store.lastUpdate) { store.refresh() }
             popover.appearance = NSApp.effectiveAppearance
             popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
         }
